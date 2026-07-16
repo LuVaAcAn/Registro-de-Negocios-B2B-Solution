@@ -52,9 +52,10 @@ Si tienes instalado PyInstaller, puedes generar el ejecutable ejecutando:
 build_exe.bat
 ```
 
+Y si no lo tienes, ejecútalo de igual manera. Build_exe instalará todas las dependencias por ti.
+
 ## 🌱 Futuras mejoras
 
-- Exportación a Excel.
 - Exportación a PDF.
 - Sistema de respaldos.
 - Búsqueda avanzada.
