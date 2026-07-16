@@ -27,7 +27,7 @@ Se publica como **software de código abierto** para que cualquier persona pueda
 ## 📦 Instalación
 
 ```bash
-git clone https://github.com/tu-usuario/Registro-Negocios-B2B-Solution.git
+git clone https://github.com/LuVaAcAn/Registro-Negocios-B2B-Solution.git
 
 cd Registro-Negocios-B2B-Solution
 
