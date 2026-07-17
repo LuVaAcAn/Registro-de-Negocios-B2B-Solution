@@ -36,12 +36,15 @@ import os
 import sys
 import csv
 import sqlite3
+import shutil
+import glob
+import time
 import datetime
 import calendar as calendar_module
 import unicodedata
 import webbrowser
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, colorchooser
 
 try:
     import openpyxl
@@ -61,6 +64,22 @@ try:
 except ImportError:
     REPORTLAB_OK = False
 
+try:
+    from cryptography.fernet import Fernet, InvalidToken
+    CRYPTO_OK = True
+except ImportError:
+    CRYPTO_OK = False
+
+try:
+    import matplotlib
+    matplotlib.use("TkAgg")
+    import matplotlib.pyplot as plt
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    MATPLOTLIB_OK = True
+except ImportError:
+    MATPLOTLIB_OK = False
+
 # ---------------------------------------------------------------------------
 # Rutas y base de datos
 # ---------------------------------------------------------------------------
@@ -68,6 +87,10 @@ except ImportError:
 APP_DIR = os.path.dirname(os.path.abspath(sys.executable)) if getattr(sys, "frozen", False) \
     else os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(APP_DIR, "negocios.db")
+DB_ENC_PATH = DB_PATH + ".enc"
+DB_KEY_PATH = os.path.join(APP_DIR, "negocios.key")
+BACKUPS_DIR = os.path.join(APP_DIR, "backups")
+ATTACHMENTS_DIR = os.path.join(APP_DIR, "adjuntos")
 
 ESTADOS = ["Activo", "Potencial", "Inactivo"]
 
@@ -238,9 +261,19 @@ class Database:
                 timestamp TEXT NOT NULL
             )
         """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS attachments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                stored_name TEXT NOT NULL,
+                added_at TEXT NOT NULL
+            )
+        """)
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_businesses_category ON businesses(category_id)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_businesses_code ON businesses(code)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_history_code ON history(code)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_attachments_code ON attachments(code)")
         self.conn.commit()
 
     def _migrate(self):
@@ -452,6 +485,89 @@ class Database:
             "SELECT * FROM history ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
 
+    # ---- adjuntos ----
+    def add_attachment(self, code, src_path):
+        folder = os.path.join(ATTACHMENTS_DIR, code)
+        os.makedirs(folder, exist_ok=True)
+        filename = os.path.basename(src_path)
+        stored_name = f"{int(time.time() * 1000)}_{filename}"
+        shutil.copy2(src_path, os.path.join(folder, stored_name))
+        self.conn.execute(
+            "INSERT INTO attachments (code, filename, stored_name, added_at) VALUES (?,?,?,?)",
+            (code, filename, stored_name, datetime.datetime.now().strftime("%d/%m/%Y %H:%M"))
+        )
+        self.conn.commit()
+
+    def get_attachments(self, code):
+        return self.conn.execute(
+            "SELECT * FROM attachments WHERE code = ? ORDER BY id DESC", (code,)
+        ).fetchall()
+
+    def attachment_count(self, code):
+        row = self.conn.execute("SELECT COUNT(*) c FROM attachments WHERE code = ?", (code,)).fetchone()
+        return row["c"] if row else 0
+
+    def attachment_path(self, row):
+        return os.path.join(ATTACHMENTS_DIR, row["code"], row["stored_name"])
+
+    def delete_attachment(self, attachment_id):
+        row = self.conn.execute("SELECT * FROM attachments WHERE id = ?", (attachment_id,)).fetchone()
+        if row:
+            try:
+                os.remove(self.attachment_path(row))
+            except Exception:
+                pass
+            self.conn.execute("DELETE FROM attachments WHERE id = ?", (attachment_id,))
+            self.conn.commit()
+
+    # ---- copias de seguridad ----
+    def create_backup(self, reason="manual"):
+        os.makedirs(BACKUPS_DIR, exist_ok=True)
+        try:
+            self.conn.execute("PRAGMA wal_checkpoint(FULL)")
+            self.conn.commit()
+        except Exception:
+            pass
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        dest = os.path.join(BACKUPS_DIR, f"negocios_{ts}_{reason}.db")
+        shutil.copy2(self.path, dest)
+        self._prune_backups()
+        return dest
+
+    def _prune_backups(self, keep=20):
+        files = sorted(glob.glob(os.path.join(BACKUPS_DIR, "negocios_*.db")),
+                        key=os.path.getmtime, reverse=True)
+        for f in files[keep:]:
+            try:
+                os.remove(f)
+            except Exception:
+                pass
+
+    def list_backups(self):
+        files = sorted(glob.glob(os.path.join(BACKUPS_DIR, "negocios_*.db")),
+                        key=os.path.getmtime, reverse=True)
+        return files
+
+    def restore_backup(self, path):
+        try:
+            self.conn.execute("PRAGMA wal_checkpoint(FULL)")
+            self.conn.close()
+        except Exception:
+            pass
+        shutil.copy2(path, self.path)
+        for junk in (self.path + "-wal", self.path + "-shm"):
+            try:
+                os.remove(junk)
+            except Exception:
+                pass
+        self.conn = sqlite3.connect(self.path)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode = WAL")
+        self.conn.execute("PRAGMA synchronous = NORMAL")
+        self.conn.execute("PRAGMA temp_store = MEMORY")
+        self.conn.execute("PRAGMA cache_size = -8000")
+        self.conn.execute("PRAGMA foreign_keys = ON")
+
 
 # ---------------------------------------------------------------------------
 # Paleta — tema claro / oscuro conmutable
@@ -477,6 +593,44 @@ DARK_THEME = {
 
 THEMES = {"light": LIGHT_THEME, "dark": DARK_THEME}
 
+ACCENT_PRESETS = [
+    ("Azul (por defecto)", "#2563EB"),
+    ("Verde", "#16A34A"),
+    ("Púrpura", "#7C3AED"),
+    ("Naranja", "#EA580C"),
+    ("Rosa", "#DB2777"),
+    ("Rojo", "#DC2626"),
+    ("Turquesa", "#0D9488"),
+]
+
+
+def _clamp(v):
+    return max(0, min(255, int(v)))
+
+
+def _hex_to_rgb(hex_color):
+    hex_color = (hex_color or "").lstrip("#")
+    if len(hex_color) != 6:
+        hex_color = "2563EB"
+    return tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def darken_hex(hex_color, factor=0.85):
+    r, g, b = _hex_to_rgb(hex_color)
+    r, g, b = (_clamp(c * factor) for c in (r, g, b))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def mix_hex(hex_color, target_hex, amount=0.85):
+    """Mezcla hex_color hacia target_hex (amount=0 -> igual a hex_color, 1 -> igual a target_hex)."""
+    r1, g1, b1 = _hex_to_rgb(hex_color)
+    r2, g2, b2 = _hex_to_rgb(target_hex)
+    r = _clamp(r1 + (r2 - r1) * amount)
+    g = _clamp(g1 + (g2 - g1) * amount)
+    b = _clamp(b1 + (b2 - b1) * amount)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
 # Estos nombres quedan como variables de módulo "mutables": set_theme() las
 # reasigna, y como toda la interfaz se reconstruye al cambiar de tema, los
 # widgets nuevos siempre leen el valor vigente en el momento de crearse.
@@ -486,9 +640,18 @@ SUCCESS = SUCCESS_SOFT = DANGER = DANGER_SOFT = WARN_SOFT = WARN_TEXT = FAV_COLO
 ESTADO_COLORS = {}
 
 
-def set_theme(name):
-    """Aplica la paleta 'light' o 'dark' a las variables de módulo."""
-    palette = THEMES.get(name, LIGHT_THEME)
+def set_theme(name, accent=None):
+    """Aplica la paleta 'light' o 'dark' a las variables de módulo. Si se
+    indica 'accent' (color hex), reemplaza el azul de acento por ese color
+    en toda la interfaz — es la base del tema personalizable."""
+    palette = dict(THEMES.get(name, LIGHT_THEME))
+    if accent:
+        palette["ACCENT"] = accent
+        palette["ACCENT_HOVER"] = darken_hex(accent, 0.82)
+        if name == "dark":
+            palette["ACCENT_SOFT"] = mix_hex(accent, palette["SURFACE_ALT"], 0.55)
+        else:
+            palette["ACCENT_SOFT"] = mix_hex(accent, "#FFFFFF", 0.88)
     globals().update(palette)
     global ESTADO_COLORS
     ESTADO_COLORS = {"Activo": palette["SUCCESS"], "Potencial": palette["WARN_TEXT"],
@@ -526,6 +689,85 @@ def save_config(cfg):
     try:
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Cifrado de la base de datos "en reposo"
+# ---------------------------------------------------------------------------
+# No hay contraseña de acceso a la app: la clave de cifrado se guarda en un
+# archivo local (negocios.key) junto al programa. Esto NO protege contra
+# alguien que copie ambos archivos (.db.enc + .key) juntos, pero sí protege
+# la base si, por ejemplo, solo el archivo negocios.db.enc se filtra o se
+# sube por accidente a un lugar donde no debía (nube, correo, USB perdido).
+#
+# Mientras el programa está abierto, trabaja con una copia de trabajo sin
+# cifrar (negocios.db) porque SQLite necesita acceso directo al archivo.
+# Al cerrar correctamente, esa copia se cifra a negocios.db.enc y se borra
+# la copia en claro. Si el programa se cierra de golpe (falla eléctrica,
+# tarea finalizada a la fuerza), la próxima vez sigue usando la copia sin
+# cifrar tal cual estaba, para no perder datos — y se vuelve a cifrar en el
+# siguiente cierre normal.
+
+def ensure_encryption_key():
+    if not CRYPTO_OK:
+        return None
+    if os.path.exists(DB_KEY_PATH):
+        with open(DB_KEY_PATH, "rb") as f:
+            return f.read()
+    key = Fernet.generate_key()
+    with open(DB_KEY_PATH, "wb") as f:
+        f.write(key)
+    return key
+
+
+def unlock_database():
+    """Descifra negocios.db.enc -> negocios.db si hace falta, antes de abrir
+    la conexión SQLite normal."""
+    if not CRYPTO_OK or os.path.exists(DB_PATH):
+        return
+    if os.path.exists(DB_ENC_PATH):
+        try:
+            key = ensure_encryption_key()
+            fernet = Fernet(key)
+            with open(DB_ENC_PATH, "rb") as fh:
+                data = fernet.decrypt(fh.read())
+            with open(DB_PATH, "wb") as fh:
+                fh.write(data)
+        except InvalidToken:
+            messagebox.showerror(
+                "No se pudo descifrar la base de datos",
+                f"No se pudo abrir {os.path.basename(DB_ENC_PATH)} con la clave disponible "
+                f"({os.path.basename(DB_KEY_PATH)}). Si moviste el programa a otra carpeta o "
+                f"perdiste el archivo .key, no es posible recuperar los datos cifrados sin él."
+            )
+
+
+def lock_database(db):
+    """Cifra la base de datos al cerrar la app (si 'cryptography' está disponible)."""
+    if not CRYPTO_OK:
+        return
+    try:
+        db.conn.execute("PRAGMA wal_checkpoint(FULL)")
+        db.conn.commit()
+        db.conn.close()
+    except Exception:
+        pass
+    if not os.path.exists(DB_PATH):
+        return
+    try:
+        key = ensure_encryption_key()
+        fernet = Fernet(key)
+        with open(DB_PATH, "rb") as fh:
+            data = fh.read()
+        with open(DB_ENC_PATH, "wb") as fh:
+            fh.write(fernet.encrypt(data))
+        for p in (DB_PATH, DB_PATH + "-wal", DB_PATH + "-shm"):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -749,13 +991,14 @@ class App(tk.Tk):
         super().__init__()
         self.config_data = load_config()
         self._theme_name = self.config_data.get("theme", "light")
-        set_theme(self._theme_name)
+        self._apply_theme()
 
         self.title("Registro de Negocios — Base de datos local")
         self.geometry(self.config_data.get("geometry") or "1360x800")
         self.configure(bg=SURFACE_ALT)
         self.minsize(980, 600)
 
+        unlock_database()
         self.db = Database(DB_PATH)
         self.categories = {}
         self.tab_widgets = {}       # nombre_rubro -> {"frame", "tree"}
@@ -768,6 +1011,7 @@ class App(tk.Tk):
         self._build_layout()
         self._build_shortcuts()
         self.refresh_all(rebuild_tabs=True)
+        self.maybe_auto_backup()
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(80, lambda: self.rubro_combo.focus_set())
@@ -779,10 +1023,29 @@ class App(tk.Tk):
             save_config(self.config_data)
         except Exception:
             pass
+        try:
+            self.db.create_backup(reason="cierre")
+        except Exception:
+            pass
+        lock_database(self.db)
         self.destroy()
 
     def current_theme(self):
         return getattr(self, "_theme_name", self.config_data.get("theme", "light"))
+
+    def _apply_theme(self):
+        set_theme(self._theme_name, accent=self.config_data.get("accent"))
+
+    def maybe_auto_backup(self):
+        """Crea un respaldo automático una vez al día (además del que se
+        genera siempre al cerrar el programa normalmente)."""
+        today_tag = datetime.date.today().strftime("%Y%m%d")
+        existing = [f for f in self.db.list_backups() if f"_{today_tag}_" in os.path.basename(f)]
+        if not existing:
+            try:
+                self.db.create_backup(reason="auto")
+            except Exception:
+                pass
 
     # ================================================================
     # Tema claro / oscuro
@@ -790,9 +1053,15 @@ class App(tk.Tk):
     def toggle_theme(self):
         new_theme = "dark" if self.current_theme() == "light" else "light"
         self._theme_name = new_theme
-        set_theme(new_theme)
+        self._apply_theme()
         self.config_data["theme"] = new_theme
         save_config(self.config_data)
+        self._rebuild_ui()
+
+    def set_custom_accent(self, hex_color):
+        self.config_data["accent"] = hex_color
+        save_config(self.config_data)
+        self._apply_theme()
         self._rebuild_ui()
 
     def _rebuild_ui(self):
@@ -871,6 +1140,10 @@ class App(tk.Tk):
                      highlightbackground=BORDER, highlightthickness=1, font=FONT_SMALL,
                      padx=10, pady=6, command=self.toggle_theme).pack(side="right", padx=(8, 0))
 
+        ModernButton(header_actions, text="⚙ Ajustes", bg=SURFACE, fg=TEXT, hover=SURFACE_ALT,
+                     highlightbackground=BORDER, highlightthickness=1, font=FONT_SMALL,
+                     padx=10, pady=6, command=self.show_settings_dialog).pack(side="right", padx=(8, 0))
+
         self.notif_btn = ModernButton(header_actions, text="🔔 Notificaciones", bg=SURFACE, fg=TEXT,
                                        hover=SURFACE_ALT, highlightbackground=BORDER, highlightthickness=1,
                                        font=FONT_SMALL, padx=10, pady=6, command=self.show_notifications_dialog)
@@ -882,8 +1155,21 @@ class App(tk.Tk):
         tk.Label(stats_box, textvariable=self.stats_var, font=FONT_SMALL, bg=SURFACE_ALT,
                  fg=TEXT_SOFT).pack(anchor="e")
 
-        self.paned = ttk.PanedWindow(self, orient="horizontal")
-        self.paned.pack(fill="both", expand=True, padx=20, pady=(10, 8))
+        # ---- Navegación entre "páginas": Directorio  /  Dashboard ----
+        nav = tk.Frame(self, bg=SURFACE_ALT)
+        nav.pack(fill="x", padx=20, pady=(2, 0))
+        self.nav_buttons = {}
+        for key, label in (("directorio", "🗂 Directorio"), ("dashboard", "📊 Dashboard")):
+            btn = ModernButton(nav, text=label, bg=SURFACE_ALT, fg=TEXT_SOFT, hover=SURFACE,
+                                highlightbackground=BORDER, highlightthickness=1, font=FONT_LABEL,
+                                padx=14, pady=7, command=lambda k=key: self.show_page(k))
+            btn.pack(side="left", padx=(0, 8))
+            self.nav_buttons[key] = btn
+
+        self.main_container = tk.Frame(self, bg=SURFACE_ALT)
+        self.main_container.pack(fill="both", expand=True, padx=20, pady=(10, 8))
+
+        self.paned = ttk.PanedWindow(self.main_container, orient="horizontal")
 
         form_holder = tk.Frame(self.paned, bg=SURFACE_ALT)
         dir_holder = tk.Frame(self.paned, bg=SURFACE_ALT)
@@ -893,6 +1179,12 @@ class App(tk.Tk):
         self._build_form(form_holder)
         self._build_directory(dir_holder)
 
+        self.dashboard_frame = tk.Frame(self.main_container, bg=SURFACE)
+        self._build_dashboard_page(self.dashboard_frame)
+
+        self.current_page = getattr(self, "current_page", "directorio")
+        self.show_page(self.current_page)
+
         footer = tk.Frame(self, bg=SURFACE_ALT)
         footer.pack(fill="x", padx=20, pady=(0, 12))
         shortcuts_text = (
@@ -901,6 +1193,21 @@ class App(tk.Tk):
         )
         tk.Label(footer, text=shortcuts_text, font=("Segoe UI", 8), bg=SURFACE_ALT, fg=TEXT_FAINT)\
             .pack(anchor="w")
+
+    def show_page(self, key):
+        self.current_page = key
+        self.paned.pack_forget()
+        self.dashboard_frame.pack_forget()
+        if key == "dashboard":
+            self.dashboard_frame.pack(fill="both", expand=True)
+            self.refresh_dashboard(self.db.get_businesses())
+        else:
+            self.paned.pack(fill="both", expand=True)
+        for k, btn in self.nav_buttons.items():
+            active = k == key
+            btn.configure(bg=ACCENT if active else SURFACE_ALT, fg="white" if active else TEXT_SOFT)
+            btn._bg = ACCENT if active else SURFACE_ALT
+            btn._hover = ACCENT_HOVER if active else SURFACE
 
     # ================================================================
     # Atajos de teclado
@@ -1129,14 +1436,11 @@ class App(tk.Tk):
         self.sort_combo.pack(side="left", padx=(4, 0))
         self.sort_combo.bind("<<ComboboxSelected>>", lambda e: self.refresh_notebook())
 
-        # ---- Notebook (Dashboard + Vista general + rubros) ----
+        # ---- Notebook (Vista general + rubros) ----
         notebook_card = Card(right)
         notebook_card.pack(fill="both", expand=True)
         self.notebook = ttk.Notebook(notebook_card)
         self.notebook.pack(fill="both", expand=True, padx=4, pady=4)
-
-        self.dashboard_frame = tk.Frame(self.notebook, bg=SURFACE)
-        self.notebook.add(self.dashboard_frame, text="📊 Dashboard")
 
         # ---- Acciones sobre selección ----
         actions = tk.Frame(right, bg=SURFACE_ALT)
@@ -1273,13 +1577,12 @@ class App(tk.Tk):
             self._refresh_tab_contents(filtered, filtered_grouped)
 
         self.update_stats(len(all_rows))
-        self.refresh_dashboard(all_rows)
+        if getattr(self, "current_page", "directorio") == "dashboard":
+            self.refresh_dashboard(all_rows)
 
     def _rebuild_tabs(self, grouped, all_filtered_rows):
         for tab_id in list(self.notebook.tabs()):
             frame_widget = self.nametowidget(tab_id)
-            if frame_widget is self.dashboard_frame:
-                continue
             self.notebook.forget(tab_id)
             frame_widget.destroy()
 
@@ -1296,11 +1599,15 @@ class App(tk.Tk):
 
             toolbar = tk.Frame(frame, bg=SURFACE)
             toolbar.pack(fill="x", padx=10, pady=(10, 0))
-            tk.Label(toolbar, text=f"{name} · siglas {meta['prefix']}", font=FONT_LABEL,
-                     bg=SURFACE, fg=TEXT).pack(side="left")
-            ModernButton(toolbar, text="🗑 Eliminar rubro", bg=DANGER_SOFT, fg=DANGER, hover="#FEE4E2",
-                         font=("Segoe UI", 8, "bold"), padx=8, pady=3,
-                         command=lambda n=name: self.delete_category(n)).pack(side="right")
+            del_btn = ModernButton(toolbar, text="🗑 Eliminar rubro", bg=DANGER_SOFT, fg=DANGER, hover="#FEE4E2",
+                                    font=("Segoe UI", 8, "bold"), padx=8, pady=3,
+                                    command=lambda n=name: self.delete_category(n))
+            del_btn.pack(side="right")  # se empaqueta primero para que SIEMPRE tenga su espacio reservado
+            label_text = f"{name} · siglas {meta['prefix']}"
+            if len(label_text) > 42:
+                label_text = label_text[:40] + "…"
+            name_label = tk.Label(toolbar, text=label_text, font=FONT_LABEL, bg=SURFACE, fg=TEXT, anchor="w")
+            name_label.pack(side="left", fill="x", expand=True, padx=(0, 8))
 
             rows = grouped.get(name, [])
             tree = self._build_tree(frame, COLUMNS, rows)
@@ -1451,6 +1758,9 @@ class App(tk.Tk):
             menu.add_command(label="✏ Editar", command=self.edit_selected)
             menu.add_command(label="⧉ Duplicar", command=self.duplicate_selected)
             menu.add_command(label="🕒 Ver historial", command=self.show_history_dialog)
+            att_count = self.db.attachment_count(codes[0])
+            att_label = f"📎 Adjuntos ({att_count})" if att_count else "📎 Adjuntos"
+            menu.add_command(label=att_label, command=lambda: self.show_attachments_dialog(codes[0]))
             menu.add_separator()
             menu.add_command(label="🗑 Eliminar", command=self.delete_selected)
         else:
@@ -1518,6 +1828,12 @@ class App(tk.Tk):
     # -----------------------------------------------------------------
     # Dashboard
     # -----------------------------------------------------------------
+    def _build_dashboard_page(self, parent):
+        """El contenido real del dashboard se genera en refresh_dashboard();
+        aquí solo dejamos el contenedor listo."""
+        tk.Label(parent, text="Cargando dashboard…", font=FONT_SMALL, bg=SURFACE, fg=TEXT_FAINT)\
+            .pack(padx=16, pady=16, anchor="w")
+
     def refresh_dashboard(self, businesses):
         frame = self.dashboard_frame
         if frame is None:
@@ -1640,6 +1956,87 @@ class App(tk.Tk):
             tk.Label(activity, text="Sin actividad registrada todavía.", font=FONT_SMALL,
                      bg=SURFACE, fg=TEXT_FAINT).pack(anchor="w", padx=14, pady=6)
         tk.Frame(activity, bg=SURFACE, height=10).pack()
+
+        self._build_advanced_charts(pad, businesses, by_cat)
+
+    def _build_advanced_charts(self, parent, businesses, by_cat):
+        charts_card = Card(parent)
+        charts_card.pack(fill="both", expand=True, pady=(16, 0))
+        tk.Label(charts_card, text="📈 Gráficos", font=FONT_SUB, bg=SURFACE, fg=TEXT)\
+            .pack(anchor="w", padx=14, pady=(12, 6))
+
+        if not MATPLOTLIB_OK:
+            tk.Label(charts_card, text="Para ver gráficos avanzados (pastel y evolución mensual) instala "
+                                       "matplotlib:  pip install matplotlib",
+                     font=FONT_SMALL, bg=SURFACE, fg=TEXT_FAINT, wraplength=500, justify="left")\
+                .pack(anchor="w", padx=14, pady=(0, 14))
+            return
+
+        charts_row = tk.Frame(charts_card, bg=SURFACE)
+        charts_row.pack(fill="both", expand=True, padx=8, pady=(0, 12))
+
+        fig = Figure(figsize=(9.6, 3.4), dpi=96)
+        fig.patch.set_facecolor(SURFACE)
+        ax_pie = fig.add_subplot(1, 2, 1)
+        ax_bar = fig.add_subplot(1, 2, 2)
+        for ax in (ax_pie, ax_bar):
+            ax.set_facecolor(SURFACE)
+
+        # ---- Pastel: negocios por rubro ----
+        if by_cat:
+            labels = list(by_cat.keys())
+            values = list(by_cat.values())
+            palette = [ACCENT, SUCCESS, WARN_TEXT, DANGER, FAV_COLOR, TEXT_SOFT] * (len(labels) // 6 + 1)
+            wedges, _texts, autotexts = ax_pie.pie(
+                values, labels=None, autopct=lambda p: f"{p:.0f}%" if p >= 6 else "",
+                colors=palette[:len(labels)], textprops={"color": "white", "fontsize": 8},
+                wedgeprops={"linewidth": 1.5, "edgecolor": SURFACE},
+            )
+            ax_pie.legend(wedges, labels, loc="center left", bbox_to_anchor=(1.0, 0.5),
+                          fontsize=7, frameon=False, labelcolor=TEXT)
+        else:
+            ax_pie.text(0.5, 0.5, "Sin datos todavía", ha="center", va="center", color=TEXT_FAINT, fontsize=9)
+            ax_pie.set_xticks([])
+            ax_pie.set_yticks([])
+        ax_pie.set_title("Negocios por rubro", color=TEXT, fontsize=10)
+
+        # ---- Barras: negocios agregados por mes (últimos 6 meses) ----
+        by_month = {}
+        for b in businesses:
+            d = parse_ddmmyyyy(b["fecha"])
+            if d:
+                key = d.strftime("%Y-%m")
+                by_month[key] = by_month.get(key, 0) + 1
+        months = []
+        today = datetime.date.today()
+        cursor = today.replace(day=1)
+        for _ in range(6):
+            months.append(cursor.strftime("%Y-%m"))
+            cursor = (cursor - datetime.timedelta(days=1)).replace(day=1)
+        months.reverse()
+        month_labels = [datetime.datetime.strptime(m, "%Y-%m").strftime("%b").capitalize() for m in months]
+        month_values = [by_month.get(m, 0) for m in months]
+
+        bars = ax_bar.bar(month_labels, month_values, color=ACCENT, width=0.55)
+        for b in bars:
+            h = b.get_height()
+            if h > 0:
+                ax_bar.annotate(str(int(h)), (b.get_x() + b.get_width() / 2, h),
+                                textcoords="offset points", xytext=(0, 3),
+                                ha="center", fontsize=7, color=TEXT)
+        ax_bar.set_title("Negocios agregados por mes", color=TEXT, fontsize=10)
+        ax_bar.tick_params(colors=TEXT_SOFT, labelsize=8)
+        for spine in ("top", "right"):
+            ax_bar.spines[spine].set_visible(False)
+        for spine in ("left", "bottom"):
+            ax_bar.spines[spine].set_color(BORDER)
+        ax_bar.set_ylim(bottom=0)
+
+        fig.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=charts_row)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
+        plt.close(fig)  # evita acumular figuras en memoria entre refrescos
 
     # -----------------------------------------------------------------
     # Registrar negocio
@@ -2068,6 +2465,246 @@ class App(tk.Tk):
             .pack(side="left", expand=True, fill="x")
 
     # -----------------------------------------------------------------
+    # Ajustes: seguridad / cifrado, respaldos, apariencia
+    # -----------------------------------------------------------------
+    def show_settings_dialog(self):
+        dialog = tk.Toplevel(self)
+        dialog.title("Ajustes")
+        dialog.configure(bg=SURFACE_ALT)
+        dialog.geometry("620x680")
+        dialog.minsize(480, 420)
+        dialog.transient(self)
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+
+        tk.Label(dialog, text="Ajustes", font=FONT_TITLE, bg=SURFACE_ALT, fg=TEXT)\
+            .pack(anchor="w", padx=18, pady=(16, 8))
+
+        scroll = ScrollableFrame(dialog, bg=SURFACE_ALT)
+        scroll.pack(fill="both", expand=True, padx=18)
+        body = scroll.inner
+        body.configure(pady=4)
+
+        def section(title, subtitle=None):
+            card = Card(body)
+            card.pack(fill="x", pady=(0, 14))
+            tk.Label(card, text=title, font=FONT_SUB, bg=SURFACE, fg=TEXT).pack(anchor="w", padx=16, pady=(14, 2))
+            if subtitle:
+                tk.Label(card, text=subtitle, font=FONT_SMALL, bg=SURFACE, fg=TEXT_FAINT,
+                         wraplength=520, justify="left").pack(anchor="w", padx=16, pady=(0, 8))
+            return card
+
+        # ---- Seguridad / cifrado ----
+        sec = section("🔒 Seguridad y cifrado")
+        if CRYPTO_OK:
+            estado_txt = ("La base de datos se cifra automáticamente cada vez que cierras el programa "
+                          "correctamente, y se descifra al volver a abrirlo. La clave vive en "
+                          f"\"{os.path.basename(DB_KEY_PATH)}\", junto al programa — no la borres ni la muevas "
+                          "a otro lado, o no podrás recuperar tus datos.")
+            color = SUCCESS
+        else:
+            estado_txt = ("El cifrado no está activo porque falta el paquete 'cryptography'. "
+                          "Instálalo con:  pip install cryptography  (o agrégalo antes de generar el .exe).")
+            color = WARN_TEXT
+        tk.Label(sec, text=estado_txt, font=FONT_SMALL, bg=SURFACE, fg=color, wraplength=540, justify="left")\
+            .pack(anchor="w", padx=16, pady=(0, 14))
+
+        # ---- Respaldos ----
+        bkp = section("💾 Copias de seguridad",
+                       "Se crea un respaldo automático una vez al día y también cada vez que cierras el "
+                       "programa. Se conservan los últimos 20.")
+        bkp_btns = tk.Frame(bkp, bg=SURFACE)
+        bkp_btns.pack(fill="x", padx=16, pady=(0, 10))
+        ModernButton(bkp_btns, text="Crear respaldo ahora", bg=ACCENT, fg="white",
+                     command=lambda: self._create_manual_backup(dialog)).pack(side="left", padx=(0, 8))
+        ModernButton(bkp_btns, text="♻ Restaurar un respaldo", bg=SURFACE, fg=TEXT, hover=SURFACE_ALT,
+                     highlightbackground=BORDER, highlightthickness=1,
+                     command=lambda: self.show_restore_dialog(dialog)).pack(side="left")
+
+        backups = self.db.list_backups()
+        tk.Label(bkp, text=f"{len(backups)} respaldo(s) guardado(s) en la carpeta \"backups\".",
+                 font=("Segoe UI", 8), bg=SURFACE, fg=TEXT_FAINT).pack(anchor="w", padx=16, pady=(0, 14))
+
+        # ---- Adjuntos ----
+        att = section("📎 Documentos adjuntos",
+                      "Puedes adjuntar archivos (contratos, fotos, cotizaciones) a cualquier negocio desde "
+                      "el clic derecho de la tabla → \"Adjuntos\". Se guardan en la carpeta \"adjuntos\".")
+        tk.Frame(att, bg=SURFACE, height=6).pack()
+
+        # ---- Apariencia / tema personalizado ----
+        appearance = section("🎨 Apariencia",
+                              "Elige un color de acento para toda la aplicación (botones, resaltados, "
+                              "gráficos). El tema claro/oscuro se cambia desde el botón del encabezado.")
+        swatches = tk.Frame(appearance, bg=SURFACE)
+        swatches.pack(anchor="w", padx=16, pady=(0, 6))
+        current_accent = (self.config_data.get("accent") or ACCENT_PRESETS[0][1]).upper()
+        for label, hex_color in ACCENT_PRESETS:
+            is_current = hex_color.upper() == current_accent
+            sw = tk.Frame(swatches, bg=hex_color, width=32, height=32,
+                          highlightbackground=TEXT if is_current else BORDER,
+                          highlightthickness=3 if is_current else 1, cursor="hand2")
+            sw.pack(side="left", padx=4)
+            sw.pack_propagate(False)
+            sw.bind("<Button-1>", lambda e, h=hex_color: (self.set_custom_accent(h), dialog.destroy()))
+        custom_row = tk.Frame(appearance, bg=SURFACE)
+        custom_row.pack(anchor="w", padx=16, pady=(6, 14))
+        ModernButton(custom_row, text="Elegir otro color…", bg=SURFACE, fg=TEXT, hover=SURFACE_ALT,
+                     highlightbackground=BORDER, highlightthickness=1, font=FONT_SMALL, padx=10, pady=5,
+                     command=lambda: self._pick_custom_accent(dialog)).pack(side="left", padx=(0, 8))
+        ModernButton(custom_row, text="Restablecer color por defecto", bg=SURFACE, fg=TEXT_SOFT,
+                     hover=SURFACE_ALT, highlightbackground=BORDER, highlightthickness=1, font=FONT_SMALL,
+                     padx=10, pady=5,
+                     command=lambda: (self.config_data.pop("accent", None), save_config(self.config_data),
+                                       self._apply_theme(), self._rebuild_ui(), dialog.destroy())
+                     ).pack(side="left")
+
+        ModernButton(dialog, text="Cerrar", bg=ACCENT, fg="white", command=dialog.destroy)\
+            .pack(fill="x", padx=18, pady=16)
+
+    def _create_manual_backup(self, dialog):
+        path = self.db.create_backup(reason="manual")
+        messagebox.showinfo("Respaldo creado", f"Se guardó un respaldo en:\n{path}", parent=dialog)
+        dialog.destroy()
+        self.show_settings_dialog()
+
+    def _pick_custom_accent(self, dialog):
+        color = colorchooser.askcolor(title="Elige un color de acento", parent=dialog)
+        if color and color[1]:
+            self.set_custom_accent(color[1])
+            dialog.destroy()
+
+    def show_restore_dialog(self, parent_dialog=None):
+        backups = self.db.list_backups()
+        dialog = tk.Toplevel(self)
+        dialog.title("Restaurar respaldo")
+        dialog.configure(bg=SURFACE)
+        dialog.geometry("520x420")
+        dialog.transient(self)
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+
+        tk.Label(dialog, text="Restaurar un respaldo", font=FONT_SUB, bg=SURFACE, fg=TEXT)\
+            .pack(anchor="w", padx=16, pady=(16, 4))
+        tk.Label(dialog, text="Reemplazará TODOS los datos actuales por los del respaldo elegido. "
+                              "Antes de restaurar se crea un respaldo de seguridad del estado actual.",
+                 font=FONT_SMALL, bg=SURFACE, fg=WARN_TEXT, wraplength=480, justify="left")\
+            .pack(anchor="w", padx=16, pady=(0, 10))
+
+        scroll = ScrollableFrame(dialog, bg=SURFACE)
+        scroll.pack(fill="both", expand=True, padx=16)
+        inner = scroll.inner
+
+        if not backups:
+            tk.Label(inner, text="Todavía no hay respaldos guardados.", font=FONT_SMALL,
+                     bg=SURFACE, fg=TEXT_FAINT).pack(anchor="w", pady=10)
+        for path in backups:
+            name = os.path.basename(path)
+            mtime = datetime.datetime.fromtimestamp(os.path.getmtime(path)).strftime("%d/%m/%Y %H:%M")
+            row = tk.Frame(inner, bg=SURFACE_ALT, highlightbackground=BORDER, highlightthickness=1)
+            row.pack(fill="x", pady=3)
+            tk.Label(row, text=mtime, font=FONT_LABEL, bg=SURFACE_ALT, fg=TEXT)\
+                .pack(side="left", padx=10, pady=8)
+            tk.Label(row, text=name, font=("Segoe UI", 8), bg=SURFACE_ALT, fg=TEXT_FAINT)\
+                .pack(side="left", padx=(0, 10))
+            ModernButton(row, text="Restaurar", bg=ACCENT, fg="white", font=("Segoe UI", 8, "bold"),
+                         padx=8, pady=3,
+                         command=lambda p=path: self._confirm_restore(p, dialog, parent_dialog))\
+                .pack(side="right", padx=10, pady=6)
+
+    def _confirm_restore(self, path, dialog, parent_dialog=None):
+        name = os.path.basename(path)
+        if not messagebox.askyesno(
+            "Confirmar restauración",
+            f"¿Restaurar el respaldo \"{name}\"? Se reemplazarán los datos actuales.\n\n"
+            f"Se guardará antes un respaldo de seguridad del estado actual, por si necesitas deshacerlo.",
+            parent=dialog
+        ):
+            return
+        self.db.create_backup(reason="antes_de_restaurar")
+        self.db.restore_backup(path)
+        dialog.destroy()
+        if parent_dialog:
+            parent_dialog.destroy()
+        self.refresh_all(rebuild_tabs=True)
+        self.show_msg("Se restauró el respaldo seleccionado.")
+
+    # -----------------------------------------------------------------
+    # Adjuntos
+    # -----------------------------------------------------------------
+    def show_attachments_dialog(self, code):
+        row = self.db.get_business(code)
+        if not row:
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title(f"Adjuntos — {row['negocio']}")
+        dialog.configure(bg=SURFACE)
+        dialog.geometry("520x460")
+        dialog.transient(self)
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+
+        tk.Label(dialog, text=f"📎 Adjuntos de {row['negocio']} ({code})", font=FONT_SUB,
+                 bg=SURFACE, fg=TEXT, wraplength=480, justify="left").pack(anchor="w", padx=16, pady=(16, 4))
+        tk.Label(dialog, text="Contratos, fotos, cotizaciones, etc. Se guardan como copia local junto al programa.",
+                 font=FONT_SMALL, bg=SURFACE, fg=TEXT_FAINT, wraplength=480, justify="left")\
+            .pack(anchor="w", padx=16, pady=(0, 10))
+
+        list_frame = tk.Frame(dialog, bg=SURFACE)
+        list_frame.pack(fill="both", expand=True, padx=16)
+
+        def refresh_list():
+            for w in list_frame.winfo_children():
+                w.destroy()
+            attachments = self.db.get_attachments(code)
+            if not attachments:
+                tk.Label(list_frame, text="Todavía no hay archivos adjuntos.", font=FONT_SMALL,
+                         bg=SURFACE, fg=TEXT_FAINT).pack(anchor="w", pady=10)
+            for a in attachments:
+                item = tk.Frame(list_frame, bg=SURFACE_ALT, highlightbackground=BORDER, highlightthickness=1)
+                item.pack(fill="x", pady=3)
+                tk.Label(item, text=a["filename"], font=FONT_SMALL, bg=SURFACE_ALT, fg=TEXT,
+                         anchor="w").pack(side="left", padx=10, pady=8, fill="x", expand=True)
+                tk.Label(item, text=a["added_at"], font=("Segoe UI", 7), bg=SURFACE_ALT, fg=TEXT_FAINT)\
+                    .pack(side="left", padx=(0, 8))
+                ModernButton(item, text="Abrir", bg=SURFACE, fg=TEXT, hover=SURFACE,
+                             highlightbackground=BORDER, highlightthickness=1, font=("Segoe UI", 8),
+                             padx=6, pady=2, command=lambda p=self.db.attachment_path(a): self._open_attachment(p))\
+                    .pack(side="right", padx=(0, 4), pady=6)
+                ModernButton(item, text="🗑", bg=SURFACE, fg=DANGER, hover=DANGER_SOFT,
+                             highlightbackground=BORDER, highlightthickness=1, font=("Segoe UI", 8),
+                             padx=6, pady=2,
+                             command=lambda aid=a["id"]: (self.db.delete_attachment(aid), refresh_list()))\
+                    .pack(side="right", padx=(0, 4), pady=6)
+
+        refresh_list()
+
+        def add_files():
+            paths = filedialog.askopenfilenames(title="Elegir archivo(s) para adjuntar", parent=dialog)
+            for p in paths:
+                try:
+                    self.db.add_attachment(code, p)
+                except Exception as exc:
+                    messagebox.showerror("Error al adjuntar", f"No se pudo adjuntar \"{p}\":\n{exc}", parent=dialog)
+            self.db.log_history(code, row["negocio"], "Adjunto", f"{len(paths)} archivo(s) agregado(s).")
+            refresh_list()
+
+        btns = tk.Frame(dialog, bg=SURFACE)
+        btns.pack(fill="x", padx=16, pady=12)
+        ModernButton(btns, text="➕ Agregar archivo(s)", bg=ACCENT, fg="white",
+                     command=add_files).pack(side="left", expand=True, fill="x", padx=(0, 8))
+        ModernButton(btns, text="Cerrar", bg=SURFACE, fg=TEXT, hover=SURFACE_ALT,
+                     highlightbackground=BORDER, highlightthickness=1,
+                     command=dialog.destroy).pack(side="left", expand=True, fill="x")
+
+    def _open_attachment(self, path):
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                os.system(f'open "{path}"')
+            else:
+                os.system(f'xdg-open "{path}"')
+        except Exception as exc:
+            messagebox.showerror("No se pudo abrir", f"No se pudo abrir el archivo:\n{exc}")
+
+    # -----------------------------------------------------------------
     # Eliminar rubro
     # -----------------------------------------------------------------
     def delete_category(self, name):
@@ -2091,8 +2728,72 @@ class App(tk.Tk):
     # Importar desde Excel / CSV
     # -----------------------------------------------------------------
     def import_data(self):
+        """Punto de entrada del botón Importar: primero hay que saber de qué
+        fuente viene el archivo, porque cada una tiene una estructura distinta."""
+        dialog = tk.Toplevel(self)
+        dialog.title("Importar negocios")
+        dialog.configure(bg=SURFACE_ALT)
+        dialog.geometry("480x360")
+        dialog.minsize(420, 320)
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+
+        tk.Label(dialog, text="¿De dónde vienen los datos?", font=FONT_SUB, bg=SURFACE_ALT, fg=TEXT)\
+            .pack(anchor="w", padx=18, pady=(18, 4))
+        tk.Label(dialog, text="Elige el formato del archivo para importarlo correctamente.",
+                 font=FONT_SMALL, bg=SURFACE_ALT, fg=TEXT_FAINT).pack(anchor="w", padx=18, pady=(0, 14))
+
+        def choose_maps():
+            dialog.destroy()
+            self.import_google_maps_csv()
+
+        def choose_own():
+            dialog.destroy()
+            self.import_own_export()
+
+        opt1 = Card(dialog)
+        opt1.pack(fill="x", padx=18, pady=(0, 10))
+        tk.Label(opt1, text="📍 Google Maps Scraper (CSV)", font=FONT_LABEL, bg=SURFACE, fg=TEXT)\
+            .pack(anchor="w", padx=14, pady=(12, 2))
+        tk.Label(opt1, text="Un CSV con columnas Name, Phone, Email, Website, Address, Category, etc. "
+                           "Todos los negocios van al mismo rubro — lo confirmas en una vista previa "
+                           "antes de importar de verdad.",
+                 font=FONT_SMALL, bg=SURFACE, fg=TEXT_FAINT, wraplength=420, justify="left")\
+            .pack(anchor="w", padx=14, pady=(0, 6))
+        ModernButton(opt1, text="Elegir archivo CSV…", bg=ACCENT, fg="white", command=choose_maps)\
+            .pack(anchor="w", padx=14, pady=(0, 12))
+
+        opt2 = Card(dialog)
+        opt2.pack(fill="x", padx=18)
+        tk.Label(opt2, text="🗄 Base de Datos Previa (exportación propia)", font=FONT_LABEL,
+                 bg=SURFACE, fg=TEXT).pack(anchor="w", padx=14, pady=(12, 2))
+        tk.Label(opt2, text="Un Excel con una hoja por rubro, o un CSV con columna de Rubro: el mismo "
+                           "formato que este programa genera al exportar.",
+                 font=FONT_SMALL, bg=SURFACE, fg=TEXT_FAINT, wraplength=420, justify="left")\
+            .pack(anchor="w", padx=14, pady=(0, 6))
+        ModernButton(opt2, text="Elegir archivo…", bg=SURFACE, fg=TEXT, hover=SURFACE_ALT,
+                     highlightbackground=BORDER, highlightthickness=1, command=choose_own)\
+            .pack(anchor="w", padx=14, pady=(0, 12))
+
+    def _show_import_summary(self, stats):
+        msg = (f"Importación completada:\n"
+               f"  • {stats['nuevos']} negocio(s) nuevo(s)\n"
+               f"  • {stats['actualizados']} negocio(s) actualizado(s) (el código ya existía)\n"
+               f"  • {stats['rubros_creados']} rubro(s) nuevo(s) creado(s)")
+        if stats.get("duplicados"):
+            msg += (f"\n  • {stats['duplicados']} fila(s) omitida(s) por nombre duplicado "
+                     f"(revísalas en 🔔 Notificaciones)")
+        if stats["errores"]:
+            msg += f"\n\nFilas omitidas por falta de nombre u otro dato ilegible: {stats['errores']}"
+        messagebox.showinfo("Importación completada", msg)
+
+    # -----------------------------------------------------------------
+    # Importar: Base de Datos Previa (exportación propia del programa)
+    # -----------------------------------------------------------------
+    def import_own_export(self):
         path = filedialog.askopenfilename(
-            title="Importar negocios desde Excel o CSV",
+            title="Importar negocios desde Excel o CSV (exportación propia)",
             filetypes=[("Excel o CSV", "*.xlsx *.xls *.csv"), ("Excel", "*.xlsx *.xls"), ("CSV", "*.csv")]
         )
         if not path:
@@ -2115,16 +2816,168 @@ class App(tk.Tk):
             return
 
         self.refresh_all(rebuild_tabs=True)
-        msg = (f"Importación completada:\n"
-               f"  • {stats['nuevos']} negocio(s) nuevo(s)\n"
-               f"  • {stats['actualizados']} negocio(s) actualizado(s) (el código ya existía)\n"
-               f"  • {stats['rubros_creados']} rubro(s) nuevo(s) creado(s)")
-        if stats.get("duplicados"):
-            msg += (f"\n  • {stats['duplicados']} fila(s) omitida(s) por nombre duplicado "
-                     f"(ya revisables en 🔔 Notificaciones)")
-        if stats["errores"]:
-            msg += f"\n\nFilas omitidas por falta de nombre: {stats['errores']}"
-        messagebox.showinfo("Importación completada", msg)
+        self._show_import_summary(stats)
+
+    # -----------------------------------------------------------------
+    # Importar: Google Maps Scraper CSV (con vista previa y rubro único)
+    # -----------------------------------------------------------------
+    def import_google_maps_csv(self):
+        path = filedialog.askopenfilename(
+            title="Importar CSV de Google Maps Scraper", filetypes=[("CSV", "*.csv")]
+        )
+        if not path:
+            return
+        try:
+            rows, skipped, guessed_name = self._parse_google_maps_csv(path)
+        except Exception as exc:
+            messagebox.showerror("Error al leer el archivo", f"No se pudo leer el CSV:\n{exc}")
+            return
+        if not rows:
+            messagebox.showwarning(
+                "Sin datos que importar",
+                "No se encontró ningún negocio con nombre en este archivo. Revisa que tenga una "
+                "columna 'Name' con datos."
+            )
+            return
+        self._show_google_maps_preview(rows, skipped, guessed_name)
+
+    def _parse_google_maps_csv(self, path):
+        """Lee el CSV del scraper de Google Maps. Si una fila viene corrupta
+        o sin nombre, se omite y se sigue con la siguiente (nunca se detiene
+        la importación completa por una sola fila mala)."""
+        rows, skipped = [], 0
+        category_votes = {}
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            sample = f.read(4096)
+            f.seek(0)
+            try:
+                dialect = csv.Sniffer().sniff(sample, delimiters=",;")
+            except csv.Error:
+                dialect = csv.excel
+            reader = csv.DictReader(f, dialect=dialect)
+            if not reader.fieldnames:
+                return [], 0, ""
+            header_map = {}
+            for h in reader.fieldnames:
+                key = normalize_header(h)
+                if key:
+                    header_map[h] = key
+            for raw_row in reader:
+                try:
+                    row_data = {}
+                    for h, key in header_map.items():
+                        row_data[key] = (raw_row.get(h) or "").strip()
+                    negocio = row_data.get("negocio", "").strip()
+                    if not negocio:
+                        skipped += 1
+                        continue
+                    rows.append(row_data)
+                    cat_guess = row_data.get("rubro", "").strip()
+                    if cat_guess:
+                        category_votes[cat_guess] = category_votes.get(cat_guess, 0) + 1
+                except Exception:
+                    skipped += 1
+                    continue
+        if category_votes:
+            guessed_name = max(category_votes, key=category_votes.get)
+        else:
+            guessed_name = os.path.splitext(os.path.basename(path))[0].replace("_", " ").replace("-", " ").strip().title()
+            guessed_name = guessed_name or "Sin rubro"
+        return rows, skipped, guessed_name
+
+    def _show_google_maps_preview(self, rows, skipped, guessed_name):
+        dialog = tk.Toplevel(self)
+        dialog.title("Vista previa — Google Maps Scraper CSV")
+        dialog.configure(bg=SURFACE)
+        dialog.geometry("780x580")
+        dialog.minsize(600, 440)
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+
+        tk.Label(dialog, text="Vista previa antes de importar", font=FONT_SUB, bg=SURFACE, fg=TEXT)\
+            .pack(anchor="w", padx=18, pady=(16, 2))
+        subtitle = f"{len(rows)} negocio(s) listos para importar"
+        if skipped:
+            subtitle += f"  ·  {skipped} fila(s) sin nombre se omitirán automáticamente"
+        tk.Label(dialog, text=subtitle, font=FONT_SMALL, bg=SURFACE, fg=TEXT_FAINT)\
+            .pack(anchor="w", padx=18, pady=(0, 10))
+
+        form = tk.Frame(dialog, bg=SURFACE)
+        form.pack(fill="x", padx=18, pady=(0, 10))
+        tk.Label(form, text="Todos estos negocios se importarán al mismo rubro (puedes cambiarlo):",
+                 font=FONT_SMALL, bg=SURFACE, fg=TEXT_SOFT).pack(anchor="w")
+        row1 = tk.Frame(form, bg=SURFACE)
+        row1.pack(fill="x", pady=(6, 0))
+        row1.columnconfigure(0, weight=1)
+        row1.columnconfigure(1, weight=0, minsize=130)
+        tk.Label(row1, text="Nombre del rubro", font=FONT_LABEL, bg=SURFACE, fg=TEXT_SOFT)\
+            .grid(row=0, column=0, sticky="w")
+        tk.Label(row1, text="Siglas para el código", font=FONT_LABEL, bg=SURFACE, fg=TEXT_SOFT)\
+            .grid(row=0, column=1, sticky="w", padx=(14, 0))
+        name_entry = styled_entry(row1)
+        name_entry.insert(0, guessed_name)
+        name_entry.grid(row=1, column=0, sticky="ew", ipady=4)
+        prefix_entry = styled_entry(row1)
+        prefix_entry.insert(0, sanitize_prefix(guessed_name)[:4] or "GEN")
+        prefix_entry.grid(row=1, column=1, sticky="ew", padx=(14, 0), ipady=4)
+
+        def sync_prefix(event=None):
+            if not prefix_entry._auto_edited:
+                prefix_entry.delete(0, "end")
+                prefix_entry.insert(0, sanitize_prefix(name_entry.get())[:4] or "GEN")
+        prefix_entry._auto_edited = False
+        name_entry.bind("<KeyRelease>", sync_prefix)
+        prefix_entry.bind("<KeyRelease>", lambda e: setattr(prefix_entry, "_auto_edited", True))
+
+        table_wrap = tk.Frame(dialog, bg=SURFACE)
+        table_wrap.pack(fill="both", expand=True, padx=18)
+        cols = ("negocio", "telefono", "correo", "direccion")
+        tree = ttk.Treeview(table_wrap, columns=cols, show="headings", height=10)
+        for c, label, w in (("negocio", "Negocio", 200), ("telefono", "Teléfono", 130),
+                            ("correo", "Correo", 180), ("direccion", "Dirección", 220)):
+            tree.heading(c, text=label)
+            tree.column(c, width=w, anchor="w")
+        vsb = ttk.Scrollbar(table_wrap, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="left", fill="y")
+        preview_limit = 300
+        for r in rows[:preview_limit]:
+            tree.insert("", "end", values=(r.get("negocio", ""), r.get("telefono", ""),
+                                            r.get("correo", ""), r.get("direccion", "")))
+        if len(rows) > preview_limit:
+            tk.Label(dialog, text=f"(vista previa de las primeras {preview_limit} filas de {len(rows)} — "
+                                  f"se importarán todas)",
+                     font=("Segoe UI", 8), bg=SURFACE, fg=TEXT_FAINT).pack(anchor="w", padx=18, pady=(4, 0))
+
+        def confirm_import():
+            rubro_name = name_entry.get().strip() or "Sin rubro"
+            prefix = sanitize_prefix(prefix_entry.get()) or "GEN"
+            existing = next((k for k in self.categories if k.lower() == rubro_name.lower()), None)
+            if not existing:
+                used_prefixes = {m["prefix"] for m in self.categories.values()}
+                base_prefix, n = prefix, 2
+                while prefix in used_prefixes:
+                    prefix = (base_prefix[:3] + str(n))[:4]
+                    n += 1
+                self.db.create_category(rubro_name, prefix)
+                self.categories = self.db.get_categories()
+            stats = {"nuevos": 0, "actualizados": 0, "rubros_creados": 0 if existing else 1,
+                      "errores": skipped, "duplicados": 0}
+            for row_data in rows:
+                self._import_row(rubro_name, row_data, stats)
+            dialog.destroy()
+            self.refresh_all(rebuild_tabs=True)
+            self._show_import_summary(stats)
+
+        btns = tk.Frame(dialog, bg=SURFACE)
+        btns.pack(fill="x", padx=18, pady=14)
+        ModernButton(btns, text="Cancelar", bg=SURFACE, fg=TEXT, hover=SURFACE_ALT,
+                     highlightbackground=BORDER, highlightthickness=1, command=dialog.destroy)\
+            .pack(side="left", expand=True, fill="x", padx=(0, 8))
+        ModernButton(btns, text=f"Importar {len(rows)} negocio(s)", bg=ACCENT, fg="white",
+                     command=confirm_import).pack(side="left", expand=True, fill="x")
 
     def _get_or_create_category(self, name, stats):
         name = (name or "").strip() or "Sin rubro"
