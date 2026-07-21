@@ -16,8 +16,6 @@ Hecha en **Python + Tkinter**, con base de datos **SQLite** local. Corre como sc
 - [Generar el .exe](#-generar-el-exe)
 - [Estructura de archivos que genera el programa](#-estructura-de-archivos-que-genera-el-programa)
 - [Seguridad y respaldo de datos](#-seguridad-y-respaldo-de-datos)
-- [Roadmap / a futuro](#-roadmap--a-futuro)
-- [Publicar en LinkedIn / Instagram](#-publicar-en-linkedin--instagram)
 
 ---
 
